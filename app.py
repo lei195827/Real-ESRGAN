@@ -1,3 +1,5 @@
+import gc
+import urllib
 from enum import Enum
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
@@ -113,7 +115,10 @@ def process_image(
                 output, _ = upsampler.enhance(img, outscale=outscale, alpha_upsampler=alpha_upsampler)
         except RuntimeError as error:
             raise HTTPException(status_code=500, detail=f"请求发送错误: {error}")
-
+        # 显式删除变量并清空缓存
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
         # 返回处理后的图像
         return output
 
@@ -134,36 +139,48 @@ async def upscale_image(
 ):
     # 读取上传的图像文件
     contents = await file.read()
+    img_name = file.filename  # 获取上传文件的原始名称
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
 
     if img is None:
         raise HTTPException(status_code=400, detail="无法读取上传的图像文件，请检查文件格式")
 
-    # 使用 run_in_threadpool 来异步执行图像处理任务
-    output = await run_in_threadpool(
-        process_image,
-        img=img,
-        model_name=model_name,
-        denoise_strength=denoise_strength,
-        outscale=outscale,
-        tile=tile,
-        tile_pad=tile_pad,
-        pre_pad=pre_pad,
-        face_enhance=face_enhance,
-        fp32=fp32,
-        alpha_upsampler=alpha_upsampler,
-        gpu_id=gpu_id
-    )
-
+    try:
+        # 使用 run_in_threadpool 来异步执行图像处理任务
+        output = await run_in_threadpool(
+            process_image,
+            img=img,
+            model_name=model_name,
+            denoise_strength=denoise_strength,
+            outscale=outscale,
+            tile=tile,
+            tile_pad=tile_pad,
+            pre_pad=pre_pad,
+            face_enhance=face_enhance,
+            fp32=fp32,
+            alpha_upsampler=alpha_upsampler,
+            gpu_id=gpu_id
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     # 将输出图像编码为字节流格式
     _, img_encoded = cv2.imencode('.png', output)
     img_bytes = io.BytesIO(img_encoded)
 
+    # 创建响应并设置文件名
+    response = StreamingResponse(
+        img_bytes,
+        media_type="image/png"
+    )
+    encoded_img_name = urllib.parse.quote(os.path.basename(img_name))
+    response.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{encoded_img_name}"
+
     # 返回图像流作为响应
-    return StreamingResponse(img_bytes, media_type="image/png")
+    return response
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
